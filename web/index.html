@@ -97,6 +97,13 @@ button { cursor: pointer; }
 .linkbtn { background: none; border: none; padding: 6px 0; color: var(--accent); font-weight: 600; text-decoration: underline; text-underline-offset: 3px; }
 .budgetedit { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .budgetedit input { width: 12em; }
+.bform { flex-direction: column; align-items: stretch; gap: 10px; }
+.bform .fl { display: flex; flex-direction: column; gap: 4px; font-size: .85rem; color: var(--muted); }
+.bform .fl input { width: 100%; max-width: 16em; }
+.bform .opts { display: flex; gap: 8px 14px; flex-wrap: wrap; align-items: center; color: var(--ink); }
+.bform .opt { display: inline-flex; align-items: center; gap: 5px; }
+.bform input[type=radio] { width: auto; }
+.bform .hint { font-size: .8rem; color: var(--muted); }
 
 /* Stats */
 .stats { display: grid; grid-template-columns: repeat(3, 1fr); padding: 16px 0; border-bottom: 1px solid var(--line); }
@@ -246,12 +253,13 @@ footer { margin-top: 28px; display: flex; gap: 16px; flex-wrap: wrap; align-item
   var KEY = 'depenses:v2';
   var OLD_KEY = 'depenses:v1';
   var THEME_KEY = 'depenses:v1:theme';
-  var state = { sessions: [{ id: 1, name: 'Principal', expenses: [], budgets: {} }], current: 1 };
+  var state = { sessions: [{ id: 1, name: 'Principal', expenses: [], budgets: {}, plans: [] }], current: 1 };
   var view = ym(new Date());
   var editingId = null;
   var pendingDelete = null;
   var pendingTimer = null;
   var budgetEditing = false;
+  var budgetMode = 'new';       // 'new' | 'edit'
   var sessMode = null;          // null | 'new' | 'rename'
   var sessDeleteArmed = false;
   var sessTimer = null;
@@ -274,6 +282,9 @@ footer { margin-top: 28px; display: flex; gap: 16px; flex-wrap: wrap; align-item
     state.sessions.forEach(function (s) {
       if (!Array.isArray(s.expenses)) s.expenses = [];
       if (!s.budgets || typeof s.budgets !== 'object') s.budgets = {};
+      delete s._budgetCache;
+      if (!Array.isArray(s.plans)) s.plans = migrateBudgets(s.budgets);
+      relinkList(s.plans);
     });
     if (!state.sessions.some(function (s) { return s.id === state.current; })) state.current = state.sessions[0].id;
     try { var th = localStorage.getItem(THEME_KEY); if (th) document.documentElement.setAttribute('data-theme', th); } catch (e) {}
@@ -303,58 +314,140 @@ footer { margin-top: 28px; display: flex; gap: 16px; flex-wrap: wrap; align-item
   function shiftMonth(key, delta) { var p = key.split('-'); return ym(new Date(+p[0], +p[1] - 1 + delta, 1)); }
   function daysIn(key) { var p = key.split('-'); return new Date(+p[0], +p[1], 0).getDate(); }
   function catIndex(id) { for (var i = 0; i < CATS.length; i++) if (CATS[i].id === id) return i; return CATS.length - 1; }
-  // --- Portée et report du budget -------------------------------------------------
-  // Chaque entrée de budgets[key] est soit un nombre (ancien format = portée 'forever',
-  // gardé pour compatibilité avec les données déjà enregistrées), soit un objet :
-  //   { amount, scope: 'month' | 'until' | 'forever', until }
-  //   'month'   -> couvre seulement le mois où il est défini
-  //   'until'   -> couvre ce mois jusqu'au mois 'until' inclus
-  //   'forever' -> couvre ce mois et tous les suivants, jusqu'à nouvelle définition
-  // Le reliquat (ou dépassement) d'un mois couvert se reporte sur le mois suivant,
-  // tant que ce mois suivant est lui aussi couvert.
-  function normBudget(v) {
-    if (v === undefined || v === null) return null;
-    if (typeof v === 'number') return { amount: v, scope: 'forever', until: null };
-    return v;
+  // --- Budgets par période (à partir d'une date) ------------------------------------
+  // Un budget = « plan » : { id, start:'AAAA-MM-JJ', amount, mode, fullEnd, end, kind, n, unit }
+  //   mode 'single'  : un seul budget pour toute la période [start, end[
+  //   mode 'monthly' : le même montant renouvelé chaque mois, à partir de la date de début
+  //   fullEnd = fin prévue (null = sans fin) ; end = fin réelle (coupée si un autre budget démarre avant)
+  // Le reliquat (ou le dépassement) se reporte d'un cycle au suivant, et d'un plan à celui qui
+  // démarre exactement à la fin du précédent.
+  var bcache = {};
+  function bust() { bcache = {}; }
+  function newId() { return 'p' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6); }
+  function isoParts(s) { var p = s.split('-'); return [+p[0], +p[1], +p[2]]; }
+  function mkIso(y, m, d) { return y + '-' + pad(m) + '-' + pad(d); }
+  function addMonthsIso(s, k) {
+    var p = isoParts(s);
+    var t = new Date(p[0], p[1] - 1 + k, 1);
+    var last = new Date(t.getFullYear(), t.getMonth() + 1, 0).getDate();
+    return mkIso(t.getFullYear(), t.getMonth() + 1, Math.min(p[2], last));
   }
-  // Le mois `key` est-il sous l'effet d'une définition de budget (directe ou héritée) ?
-  function isMonthCovered(key) {
-    var b = cur().budgets;
-    if (normBudget(b[key])) return true;
-    var keys = Object.keys(b).filter(function (k) { return k < key; }).sort();
-    for (var i = keys.length - 1; i >= 0; i--) {
-      var e = normBudget(b[keys[i]]);
-      if (e.scope === 'forever') return true;
-      if (e.scope === 'until') return key <= e.until;
-      if (e.scope === 'month') return false;
+  function addDaysIso(s, n) {
+    var p = isoParts(s); var t = new Date(p[0], p[1] - 1, p[2] + n);
+    return mkIso(t.getFullYear(), t.getMonth() + 1, t.getDate());
+  }
+  function daysBetween(a, b) {   // nombre de jours de a (inclus) à b (exclu)
+    var pa = isoParts(a), pb = isoParts(b);
+    return Math.round((Date.UTC(pb[0], pb[1] - 1, pb[2]) - Date.UTC(pa[0], pa[1] - 1, pa[2])) / 86400000);
+  }
+  function spentBetween(a, b) {   // dépenses de a (inclus) à b (exclu ; null = sans fin)
+    return cur().expenses.reduce(function (s, e) {
+      return (e.date >= a && (b === null || e.date < b)) ? s + e.amount : s;
+    }, 0);
+  }
+  function planAt(d) {
+    var best = null;
+    cur().plans.forEach(function (p) {
+      if (p.start <= d && (p.end === null || d < p.end) && (!best || p.start > best.start)) best = p;
+    });
+    return best;
+  }
+  function cycleStart(p, k) { return p.mode === 'monthly' ? addMonthsIso(p.start, k) : p.start; }
+  function cycleEnd(p, k) {
+    var e = p.mode === 'monthly' ? addMonthsIso(p.start, k + 1) : p.end;
+    if (p.end !== null && (e === null || e > p.end)) e = p.end;
+    return e;
+  }
+  function cycleIndexAt(p, d) {
+    if (p.mode !== 'monthly') return 0;
+    var a = isoParts(p.start), b = isoParts(d);
+    var k = (b[0] - a[0]) * 12 + (b[1] - a[1]);
+    if (k < 0) k = 0;
+    while (k > 0 && addMonthsIso(p.start, k) > d) k--;
+    while (addMonthsIso(p.start, k + 1) <= d) k++;
+    return k;
+  }
+  function lastIndex(p) {
+    if (p.mode !== 'monthly') return 0;
+    if (p.end === null) return Infinity;
+    var k = 0;
+    while (addMonthsIso(p.start, k + 1) < p.end) k++;
+    return k;
+  }
+  function planBefore(p) {   // plan qui se termine exactement là où p commence
+    var found = null;
+    cur().plans.forEach(function (q) { if (q !== p && q.end === p.start && q.start < p.start) found = q; });
+    return found;
+  }
+  function cycleBudget(p, k) {   // montant du cycle + report du cycle précédent
+    var key = state.current + ':' + p.id + ':' + k;
+    if (bcache[key] === undefined) bcache[key] = p.amount + carryIn(p, k);
+    return bcache[key];
+  }
+  function carryIn(p, k) {
+    if (k > 0) return cycleBudget(p, k - 1) - spentBetween(cycleStart(p, k - 1), cycleEnd(p, k - 1));
+    var q = planBefore(p);
+    if (!q) return 0;
+    var kq = lastIndex(q);
+    return cycleBudget(q, kq) - spentBetween(cycleStart(q, kq), cycleEnd(q, kq));
+  }
+  function cycleInfo(d) {
+    var p = planAt(d);
+    if (!p) return null;
+    var k = cycleIndexAt(p, d);
+    var cs = cycleStart(p, k), ce = cycleEnd(p, k);
+    var carry = carryIn(p, k);
+    var budget = p.amount + carry;
+    var spent = spentBetween(cs, ce);
+    return { plan: p, k: k, start: cs, end: ce, carry: carry, budget: budget, spent: spent, remaining: budget - spent };
+  }
+  function relinkList(list) {
+    list.sort(function (a, b) { return a.start < b.start ? -1 : a.start > b.start ? 1 : 0; });
+    for (var i = 0; i < list.length; i++) {
+      var nxt = list[i + 1], e = list[i].fullEnd;
+      if (nxt && (e === null || e > nxt.start)) e = nxt.start;
+      list[i].end = e;
     }
-    return false;
   }
-  // Montant injecté précisément ce mois (0 si le mois hérite seulement d'un mois antérieur).
-  function freshAmount(key) {
-    var e = normBudget(cur().budgets[key]);
-    return e ? e.amount : 0;
+  function putPlan(np) {   // ajoute un plan ; un plan de même date de début est remplacé
+    cur().plans = cur().plans.filter(function (p) { return p.start !== np.start; });
+    cur().plans.push(np);
+    relinkList(cur().plans); bust();
   }
-  function spentIn(key) {
-    return cur().expenses.filter(function (e) { return e.date.slice(0, 7) === key; })
-      .reduce(function (s, e) { return s + e.amount; }, 0);
+  function removePlanAt(start) {
+    cur().plans = cur().plans.filter(function (p) { return p.start !== start; });
+    relinkList(cur().plans); bust();
   }
-  // Budget effectif du mois = montant injecté ce mois + reliquat du mois précédent (si couvert).
-  // Mémoïsé par session car il dépend récursivement de tous les mois antérieurs.
-  function effectiveBudget(key) {
-    cur()._budgetCache = cur()._budgetCache || {};
-    var cache = cur()._budgetCache;
-    if (cache[key] !== undefined) return cache[key];
-    if (!isMonthCovered(key)) { cache[key] = 0; return 0; }
-    var fresh = freshAmount(key);
-    var prevKey = shiftMonth(key, -1);
-    var carry = 0;
-    if (isMonthCovered(prevKey)) carry = effectiveBudget(prevKey) - spentIn(prevKey);
-    var result = fresh + carry;
-    cache[key] = result;
-    return result;
+  function migrateBudgets(b) {   // anciens budgets par mois -> plans
+    var out = [];
+    Object.keys(b || {}).sort().forEach(function (key) {
+      if (!/^\d{4}-\d{2}$/.test(key)) return;
+      var v = b[key], amount, scope = 'forever', until = null;
+      if (typeof v === 'number') amount = v;
+      else if (v && typeof v === 'object') { amount = +v.amount || 0; scope = v.scope || 'forever'; until = v.until || null; }
+      else return;
+      if (!(amount > 0)) return;
+      var end = null, n = 1;
+      if (scope === 'month') end = shiftMonth(key, 1) + '-01';
+      else if (scope === 'until' && until) {
+        end = shiftMonth(until, 1) + '-01';
+        var a = key.split('-'), u = until.split('-');
+        n = Math.max(1, (+u[0] - +a[0]) * 12 + (+u[1] - +a[1]) + 1);
+      } else scope = 'forever';
+      out.push({ id: newId(), start: key + '-01', amount: amount, mode: 'single', fullEnd: end, end: end, kind: scope, n: n, unit: 'months' });
+    });
+    return out;
   }
-  function getBudget(key) { return effectiveBudget(key); }
+  function dshort(iso) {
+    var p = isoParts(iso), o = { day: 'numeric', month: 'short' };
+    if (p[0] !== new Date().getFullYear()) o.year = 'numeric';
+    return new Intl.DateTimeFormat('fr-FR', o).format(new Date(p[0], p[1] - 1, p[2]));
+  }
+  function periodText(info) {
+    var tail = info.plan.mode === 'monthly' ? ' · renouvelé chaque mois' : '';
+    if (info.end === null) return 'Depuis le ' + dshort(info.start) + ', sans date de fin' + tail;
+    return 'Du ' + dshort(info.start) + ' au ' + dshort(info.end) + tail;
+  }
   function $(id) { return document.getElementById(id); }
   var toastTimer;
   function toast(msg) {
@@ -397,7 +490,7 @@ footer { margin-top: 28px; display: flex; gap: 16px; flex-wrap: wrap; align-item
     if (!name) { toast('Donne un nom à la session.'); $('sName').focus(); return; }
     if (sessMode === 'new') {
       var id = Date.now();
-      state.sessions.push({ id: id, name: name, expenses: [], budgets: {} });
+      state.sessions.push({ id: id, name: name, expenses: [], budgets: {}, plans: [] });
       state.current = id;
       toast('Session créée. Définis son budget.');
     } else {
@@ -426,7 +519,7 @@ footer { margin-top: 28px; display: flex; gap: 16px; flex-wrap: wrap; align-item
 
   function afterSessionChange() {
     budgetEditing = false; pendingDelete = null; editingId = null;
-    cur()._budgetCache = null;
+    bust();
     save(); resetForm(); render();
   }
 
@@ -440,17 +533,19 @@ footer { margin-top: 28px; display: flex; gap: 16px; flex-wrap: wrap; align-item
     renderSessions();
     var list = monthExpenses();
     var total = list.reduce(function (s, e) { return s + e.amount; }, 0);
-    var budget = getBudget(view);
     var isCurrent = view === ym(new Date());
     var isPast = view < ym(new Date());
     var nDays = daysIn(view);
+    // date de référence : aujourd'hui (mois en cours), fin du mois (passé) ou début du mois (futur)
+    var refDate = isCurrent ? todayStr() : isPast ? view + '-' + pad(nDays) : view + '-01';
+    var info = cycleInfo(refDate);
 
     $('monthTitle').textContent = monthLabel(view);
 
     // hero
-    var remaining = budget - total;
+    var remaining = info ? info.remaining : 0;
     var hv = $('heroValue');
-    if (budget > 0) {
+    if (info) {
       $('heroLabel').textContent = remaining >= 0 ? 'Reste à dépenser' : 'Budget dépassé de';
       hv.className = 'big' + (remaining < 0 ? ' over' : '');
       hv.innerHTML = esc(Math.abs(Math.round(remaining)).toLocaleString('fr-FR').replace(/[\u202f\u00a0]/g, '\u00a0')) + '<small>FCFA</small>';
@@ -459,58 +554,34 @@ footer { margin-top: 28px; display: flex; gap: 16px; flex-wrap: wrap; align-item
       hv.className = 'big';
       hv.innerHTML = esc(Math.round(total).toLocaleString('fr-FR').replace(/[\u202f\u00a0]/g, '\u00a0')) + '<small>FCFA</small>';
     }
-    var pct = budget > 0 ? Math.min(100, total / budget * 100) : 0;
+    var pct = info ? (info.budget > 0 ? Math.min(100, info.spent / info.budget * 100) : 100) : 0;
     var fill = $('fill');
     fill.style.width = pct + '%';
-    fill.className = 'fill' + (budget > 0 && total > budget ? ' over' : pct >= 80 ? ' warn' : '');
+    fill.className = 'fill' + (info && info.spent > info.budget ? ' over' : pct >= 80 ? ' warn' : '');
     $('bar').setAttribute('aria-valuenow', Math.round(pct));
-    $('bar').style.visibility = budget > 0 ? 'visible' : 'hidden';
+    $('bar').style.visibility = info ? 'visible' : 'hidden';
 
     // budget line
     var bl = $('budgetLine');
     if (budgetEditing) {
-      var curEntry = normBudget(cur().budgets[view]) || { amount: '', scope: 'month', until: null };
-      var scope = curEntry.scope || 'month';
-      var untilN = 1, untilUnit = 'months';
-      if (scope === 'until' && curEntry.until) {
-        var a = view.split('-'), b = curEntry.until.split('-');
-        var diff = (+b[0] - +a[0]) * 12 + (+b[1] - +a[1]) + 1;
-        if (diff > 0 && diff % 12 === 0) { untilN = diff / 12; untilUnit = 'years'; } else { untilN = diff; }
-      }
-      function radio(v, label) {
-        return '<label style="display:inline-flex;align-items:center;gap:5px;font-weight:400;color:var(--ink)">' +
-          '<input type="radio" name="bScope" value="' + v + '"' + (scope === v ? ' checked' : '') + '> ' + label + '</label>';
-      }
-      bl.innerHTML = '<div class="budgetedit" style="flex-direction:column;align-items:stretch;gap:10px">' +
-        '<input id="bInput" type="text" inputmode="numeric" aria-label="Montant du budget en FCFA" value="' + (curEntry.amount || '') + '" placeholder="150 000">' +
-        '<div style="display:flex;gap:14px;flex-wrap:wrap">' + radio('month', 'Ce mois seulement') + radio('until', 'Pendant une durée') + radio('forever', 'En continu') + '</div>' +
-        '<div id="bUntilRow" style="display:flex;gap:8px;align-items:center' + (scope === 'until' ? '' : ';visibility:hidden') + '">' +
-        'Pendant <input id="bUntilN" type="text" inputmode="numeric" style="width:4em" value="' + untilN + '">' +
-        '<select id="bUntilUnit"><option value="months"' + (untilUnit === 'months' ? ' selected' : '') + '>mois</option><option value="years"' + (untilUnit === 'years' ? ' selected' : '') + '>ans</option></select></div>' +
-        '<div class="actions"><button class="primary" id="bSave" style="flex:none">Enregistrer</button><button class="secondary" id="bCancel">Annuler</button></div></div>';
-      $('bInput').focus();
-      $('bSave').onclick = saveBudget;
-      $('bCancel').onclick = function () { budgetEditing = false; render(); };
-      $('bInput').onkeydown = function (e) { if (e.key === 'Enter') { e.preventDefault(); saveBudget(); } };
-      Array.prototype.forEach.call(document.querySelectorAll('input[name="bScope"]'), function (r) {
-        r.onchange = function () { $('bUntilRow').style.visibility = this.value === 'until' ? 'visible' : 'hidden'; };
-      });
+      renderBudgetForm(bl, info);
+    } else if (info) {
+      var note = info.carry ? ' (dont report ' + (info.carry > 0 ? '+' : '\u2212') + esc(fmt(Math.abs(info.carry))) + ')' : '';
+      bl.innerHTML = '<span>Budget : ' + esc(fmt(info.budget)) + note + '<br>' + esc(periodText(info)) + '</span>' +
+        '<span style="display:flex;gap:14px"><button class="linkbtn" id="bEdit">Modifier</button><button class="linkbtn" id="bNew">Nouveau budget</button></span>';
+      $('bEdit').onclick = function () { budgetMode = 'edit'; budgetEditing = true; render(); };
+      $('bNew').onclick = function () { budgetMode = 'new'; budgetEditing = true; render(); };
     } else {
-      var entry = normBudget(cur().budgets[view]);
-      var scopeNote = '';
-      if (entry && entry.scope === 'until') scopeNote = ' (jusqu\'à ' + esc(monthLabel(entry.until)) + ')';
-      else if (entry && entry.scope === 'month') scopeNote = ' (ce mois seulement)';
-      bl.innerHTML = '<span>' + (budget > 0 ? 'Budget du mois : ' + esc(fmt(budget)) + scopeNote : 'Aucun budget défini') + '</span>' +
-        '<button class="linkbtn" id="bEdit">' + (budget > 0 ? 'Modifier le budget' : 'Définir un budget') + '</button>';
-      $('bEdit').onclick = function () { budgetEditing = true; render(); };
+      bl.innerHTML = '<span>Aucun budget sur cette période</span><button class="linkbtn" id="bNew">Définir un budget</button>';
+      $('bNew').onclick = function () { budgetMode = 'new'; budgetEditing = true; render(); };
     }
 
     // stats
     $('sSpent').textContent = fmt(total);
     var elapsed = isCurrent ? new Date().getDate() : isPast ? nDays : 1;
     $('sAvg').textContent = fmt(total / (isPast || isCurrent ? elapsed : 1));
-    if (isCurrent && budget > 0) {
-      var left = nDays - new Date().getDate() + 1;
+    if (isCurrent && info && info.end) {
+      var left = Math.max(1, daysBetween(todayStr(), info.end));
       $('sPerDayK').textContent = 'Possible par jour';
       $('sPerDay').textContent = remaining > 0 ? fmt(remaining / left) : fmt(0);
     } else {
@@ -560,11 +631,61 @@ footer { margin-top: 28px; display: flex; gap: 16px; flex-wrap: wrap; align-item
   }
 
   /* ---------- actions ---------- */
+  function renderBudgetForm(bl, info) {
+    var p = (budgetMode === 'edit' && info) ? info.plan : null;
+    var startVal = p ? p.start : (view === ym(new Date()) ? todayStr() : view + '-01');
+    var kind = p ? p.kind : 'month';
+    var n = p ? p.n : 1, unit = p ? p.unit : 'months';
+    var mode = p ? p.mode : 'single';
+    function radio(name, v, label, checked) {
+      return '<label class="opt"><input type="radio" name="' + name + '" value="' + v + '"' + (checked ? ' checked' : '') + '> ' + label + '</label>';
+    }
+    function opt(v, label) { return '<option value="' + v + '"' + (unit === v ? ' selected' : '') + '>' + label + '</option>'; }
+    bl.innerHTML = '<div class="budgetedit bform">' +
+      '<label class="fl">Montant (FCFA)<input id="bInput" type="text" inputmode="numeric" value="' + (p ? p.amount : '') + '" placeholder="150 000"></label>' +
+      '<label class="fl">À partir du<input id="bStart" type="date" value="' + startVal + '"></label>' +
+      '<div class="opts">' + radio('bKind', 'month', 'Un mois', kind === 'month') + radio('bKind', 'until', 'Une durée', kind === 'until') + radio('bKind', 'forever', 'En continu', kind === 'forever') + '</div>' +
+      '<div id="bUntilRow" class="opts">Pendant <input id="bUntilN" type="text" inputmode="numeric" value="' + n + '" style="width:4em"><select id="bUntilUnit">' + opt('days', 'jours') + opt('months', 'mois') + opt('years', 'ans') + '</select></div>' +
+      '<div id="bModeRow" class="opts">' + radio('bMode', 'single', 'Un seul budget pour toute la période', mode === 'single') + radio('bMode', 'monthly', 'Le même montant chaque mois', mode === 'monthly') + '</div>' +
+      '<div class="hint">Même date de début : le budget en cours est corrigé. Autre date : nouveau budget, le reliquat suit s\u2019il s\u2019enchaîne sans trou. Montant 0 : supprime le budget de cette date.</div>' +
+      '<div class="actions"><button class="primary" id="bSave" style="flex:none">Enregistrer</button><button class="secondary" id="bCancel">Annuler</button></div></div>';
+    function sync() {
+      var k = document.querySelector('input[name="bKind"]:checked').value;
+      var u = $('bUntilUnit').value;
+      $('bUntilRow').style.display = k === 'until' ? 'flex' : 'none';
+      $('bModeRow').style.display = (k === 'forever' || (k === 'until' && u !== 'days')) ? 'flex' : 'none';
+    }
+    sync();
+    Array.prototype.forEach.call(document.querySelectorAll('input[name="bKind"]'), function (r) { r.onchange = sync; });
+    $('bUntilUnit').onchange = sync;
+    $('bInput').focus();
+    $('bSave').onclick = saveBudget;
+    $('bCancel').onclick = function () { budgetEditing = false; render(); };
+    $('bInput').onkeydown = function (e) { if (e.key === 'Enter') { e.preventDefault(); saveBudget(); } };
+  }
   function saveBudget() {
-    cur().budgets[view] = num($('bInput').value);
+    var amount = num($('bInput').value);
+    var start = $('bStart').value;
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(start)) { toast('Choisis une date de début.'); return; }
+    if (amount <= 0) {
+      if (!cur().plans.some(function (p) { return p.start === start; })) { toast('Entre un montant.'); return; }
+      removePlanAt(start);
+      budgetEditing = false; save(); render(); toast('Budget supprimé.');
+      return;
+    }
+    var kind = document.querySelector('input[name="bKind"]:checked').value;
+    var n = 1, unit = 'months', fullEnd = null;
+    if (kind === 'month') fullEnd = addMonthsIso(start, 1);
+    else if (kind === 'until') {
+      n = Math.max(1, num($('bUntilN').value)); unit = $('bUntilUnit').value;
+      fullEnd = unit === 'days' ? addDaysIso(start, n) : addMonthsIso(start, unit === 'years' ? 12 * n : n);
+    }
+    var mode = 'single';
+    if (kind === 'forever' || (kind === 'until' && unit !== 'days')) mode = document.querySelector('input[name="bMode"]:checked').value;
+    putPlan({ id: newId(), start: start, amount: amount, mode: mode, fullEnd: fullEnd, end: fullEnd, kind: kind, n: n, unit: unit });
+    view = start.slice(0, 7);
     budgetEditing = false; save(); render(); toast('Budget enregistré.');
   }
-
   function resetForm() {
     editingId = null;
     $('fAmount').value = ''; $('fNote').value = ''; $('fError').textContent = '';
@@ -591,7 +712,7 @@ footer { margin-top: 28px; display: flex; gap: 16px; flex-wrap: wrap; align-item
       toast('Dépense ajoutée.');
     }
     view = date.slice(0, 7);
-    cur()._budgetCache = null;
+    bust();
     save(); resetForm(); render();
   }
 
@@ -616,7 +737,7 @@ footer { margin-top: 28px; display: flex; gap: 16px; flex-wrap: wrap; align-item
         cur().expenses = cur().expenses.filter(function (x) { return x.id !== id; });
         pendingDelete = null; clearTimeout(pendingTimer);
         if (editingId === id) resetForm();
-        cur()._budgetCache = null;
+        bust();
         save(); render(); toast('Dépense supprimée.');
       } else {
         pendingDelete = id; render();
@@ -699,7 +820,7 @@ footer { margin-top: 28px; display: flex; gap: 16px; flex-wrap: wrap; align-item
       var date = dateOfTs(p.ts);
       cur().expenses.push({ id: Date.now(), amount: p.amount, cat: el.querySelector('select').value, date: date, note: el.querySelector('input').value.trim() });
       view = date.slice(0, 7);
-      cur()._budgetCache = null;
+      bust();
       save(); toast('Dépense ajoutée.');
     } else {
       toast('Ignoré.');
