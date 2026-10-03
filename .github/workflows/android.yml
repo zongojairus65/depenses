@@ -21,6 +21,9 @@ jobs:
         with:
           gradle-version: '8.9'
 
+      - name: Décoder la clé de signature
+        run: base64 -d android/app/debug.keystore.b64 > android/app/debug.keystore
+
       - name: Tests puis APK de debug
         working-directory: android
         run: gradle testDebugUnitTest assembleDebug --no-daemon

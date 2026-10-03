@@ -9,3 +9,4 @@ android/captures/
 *.iml
 .idea/
 .DS_Store
+android/app/debug.keystore

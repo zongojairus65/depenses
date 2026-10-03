@@ -43,6 +43,12 @@ Ouvre le dossier `android/`, laisse la synchronisation Gradle se faire, puis **R
 2. **Économie de batterie.** Certaines marques (Xiaomi, Tecno, Infinix, Itel, Samsung…) bloquent les applications en arrière-plan. Désactive l'optimisation de batterie pour Dépenses et autorise le démarrage automatique si le téléphone le propose. Sinon les notifications peuvent arriver en retard, ou pas du tout.
 3. **Google Play Protect.** Il peut afficher un avertissement à l'installation, parce que l'application n'est pas sur le Play Store et demande la permission SMS. Le code est dans ce dépôt : tu peux le relire.
 
+## Mises à jour de l'application
+
+Le dépôt contient une clé de signature fixe (`android/app/debug.keystore.b64`) pour que chaque nouvel APK puisse s'installer **par-dessus** l'ancien sans perdre les données. Conséquences :
+- **Garde le dépôt privé.** Quiconque possède cette clé peut signer une fausse mise à jour de ton application.
+- Un APK construit avant l'ajout de cette clé est signé autrement : le **premier** passage à la version signée avec la clé fixe oblige à désinstaller l'ancienne (les données sont alors perdues). Les mises à jour suivantes se font par-dessus.
+
 ## Données et confidentialité
 
 - Tout reste sur le téléphone. L'application n'a **pas** la permission INTERNET : elle ne peut rien envoyer en ligne.

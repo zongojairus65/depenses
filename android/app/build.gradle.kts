@@ -15,7 +15,25 @@ android {
         versionName = "1.0"
     }
 
+    // Clé de signature fixe (décodée depuis debug.keystore.b64 par le workflow) : sans elle,
+    // chaque build GitHub est signé par une clé différente et Android refuse la mise à jour
+    // par-dessus l'app installée, ce qui oblige à désinstaller (et perdre les données).
+    val sharedKeystore = file("debug.keystore")
+    signingConfigs {
+        if (sharedKeystore.exists()) {
+            create("shared") {
+                storeFile = sharedKeystore
+                storePassword = "android"
+                keyAlias = "androiddebugkey"
+                keyPassword = "android"
+            }
+        }
+    }
+
     buildTypes {
+        debug {
+            if (sharedKeystore.exists()) signingConfig = signingConfigs.getByName("shared")
+        }
         release {
             isMinifyEnabled = false
         }

@@ -303,12 +303,58 @@ footer { margin-top: 28px; display: flex; gap: 16px; flex-wrap: wrap; align-item
   function shiftMonth(key, delta) { var p = key.split('-'); return ym(new Date(+p[0], +p[1] - 1 + delta, 1)); }
   function daysIn(key) { var p = key.split('-'); return new Date(+p[0], +p[1], 0).getDate(); }
   function catIndex(id) { for (var i = 0; i < CATS.length; i++) if (CATS[i].id === id) return i; return CATS.length - 1; }
-  function getBudget(key) {
-    var b = cur().budgets;
-    if (b[key] !== undefined) return b[key];
-    var keys = Object.keys(b).filter(function (k) { return k < key; }).sort();
-    return keys.length ? b[keys[keys.length - 1]] : 0;
+  // --- Portée et report du budget -------------------------------------------------
+  // Chaque entrée de budgets[key] est soit un nombre (ancien format = portée 'forever',
+  // gardé pour compatibilité avec les données déjà enregistrées), soit un objet :
+  //   { amount, scope: 'month' | 'until' | 'forever', until }
+  //   'month'   -> couvre seulement le mois où il est défini
+  //   'until'   -> couvre ce mois jusqu'au mois 'until' inclus
+  //   'forever' -> couvre ce mois et tous les suivants, jusqu'à nouvelle définition
+  // Le reliquat (ou dépassement) d'un mois couvert se reporte sur le mois suivant,
+  // tant que ce mois suivant est lui aussi couvert.
+  function normBudget(v) {
+    if (v === undefined || v === null) return null;
+    if (typeof v === 'number') return { amount: v, scope: 'forever', until: null };
+    return v;
   }
+  // Le mois `key` est-il sous l'effet d'une définition de budget (directe ou héritée) ?
+  function isMonthCovered(key) {
+    var b = cur().budgets;
+    if (normBudget(b[key])) return true;
+    var keys = Object.keys(b).filter(function (k) { return k < key; }).sort();
+    for (var i = keys.length - 1; i >= 0; i--) {
+      var e = normBudget(b[keys[i]]);
+      if (e.scope === 'forever') return true;
+      if (e.scope === 'until') return key <= e.until;
+      if (e.scope === 'month') return false;
+    }
+    return false;
+  }
+  // Montant injecté précisément ce mois (0 si le mois hérite seulement d'un mois antérieur).
+  function freshAmount(key) {
+    var e = normBudget(cur().budgets[key]);
+    return e ? e.amount : 0;
+  }
+  function spentIn(key) {
+    return cur().expenses.filter(function (e) { return e.date.slice(0, 7) === key; })
+      .reduce(function (s, e) { return s + e.amount; }, 0);
+  }
+  // Budget effectif du mois = montant injecté ce mois + reliquat du mois précédent (si couvert).
+  // Mémoïsé par session car il dépend récursivement de tous les mois antérieurs.
+  function effectiveBudget(key) {
+    cur()._budgetCache = cur()._budgetCache || {};
+    var cache = cur()._budgetCache;
+    if (cache[key] !== undefined) return cache[key];
+    if (!isMonthCovered(key)) { cache[key] = 0; return 0; }
+    var fresh = freshAmount(key);
+    var prevKey = shiftMonth(key, -1);
+    var carry = 0;
+    if (isMonthCovered(prevKey)) carry = effectiveBudget(prevKey) - spentIn(prevKey);
+    var result = fresh + carry;
+    cache[key] = result;
+    return result;
+  }
+  function getBudget(key) { return effectiveBudget(key); }
   function $(id) { return document.getElementById(id); }
   var toastTimer;
   function toast(msg) {
@@ -380,6 +426,7 @@ footer { margin-top: 28px; display: flex; gap: 16px; flex-wrap: wrap; align-item
 
   function afterSessionChange() {
     budgetEditing = false; pendingDelete = null; editingId = null;
+    cur()._budgetCache = null;
     save(); resetForm(); render();
   }
 
@@ -422,14 +469,38 @@ footer { margin-top: 28px; display: flex; gap: 16px; flex-wrap: wrap; align-item
     // budget line
     var bl = $('budgetLine');
     if (budgetEditing) {
-      bl.innerHTML = '<div class="budgetedit"><input id="bInput" type="text" inputmode="numeric" aria-label="Budget du mois en FCFA" value="' + (budget || '') + '" placeholder="150 000">' +
-        '<button class="primary" id="bSave" style="flex:none">Enregistrer</button><button class="secondary" id="bCancel">Annuler</button></div>';
+      var curEntry = normBudget(cur().budgets[view]) || { amount: '', scope: 'month', until: null };
+      var scope = curEntry.scope || 'month';
+      var untilN = 1, untilUnit = 'months';
+      if (scope === 'until' && curEntry.until) {
+        var a = view.split('-'), b = curEntry.until.split('-');
+        var diff = (+b[0] - +a[0]) * 12 + (+b[1] - +a[1]) + 1;
+        if (diff > 0 && diff % 12 === 0) { untilN = diff / 12; untilUnit = 'years'; } else { untilN = diff; }
+      }
+      function radio(v, label) {
+        return '<label style="display:inline-flex;align-items:center;gap:5px;font-weight:400;color:var(--ink)">' +
+          '<input type="radio" name="bScope" value="' + v + '"' + (scope === v ? ' checked' : '') + '> ' + label + '</label>';
+      }
+      bl.innerHTML = '<div class="budgetedit" style="flex-direction:column;align-items:stretch;gap:10px">' +
+        '<input id="bInput" type="text" inputmode="numeric" aria-label="Montant du budget en FCFA" value="' + (curEntry.amount || '') + '" placeholder="150 000">' +
+        '<div style="display:flex;gap:14px;flex-wrap:wrap">' + radio('month', 'Ce mois seulement') + radio('until', 'Pendant une durée') + radio('forever', 'En continu') + '</div>' +
+        '<div id="bUntilRow" style="display:flex;gap:8px;align-items:center' + (scope === 'until' ? '' : ';visibility:hidden') + '">' +
+        'Pendant <input id="bUntilN" type="text" inputmode="numeric" style="width:4em" value="' + untilN + '">' +
+        '<select id="bUntilUnit"><option value="months"' + (untilUnit === 'months' ? ' selected' : '') + '>mois</option><option value="years"' + (untilUnit === 'years' ? ' selected' : '') + '>ans</option></select></div>' +
+        '<div class="actions"><button class="primary" id="bSave" style="flex:none">Enregistrer</button><button class="secondary" id="bCancel">Annuler</button></div></div>';
       $('bInput').focus();
       $('bSave').onclick = saveBudget;
       $('bCancel').onclick = function () { budgetEditing = false; render(); };
       $('bInput').onkeydown = function (e) { if (e.key === 'Enter') { e.preventDefault(); saveBudget(); } };
+      Array.prototype.forEach.call(document.querySelectorAll('input[name="bScope"]'), function (r) {
+        r.onchange = function () { $('bUntilRow').style.visibility = this.value === 'until' ? 'visible' : 'hidden'; };
+      });
     } else {
-      bl.innerHTML = '<span>' + (budget > 0 ? 'Budget du mois : ' + esc(fmt(budget)) : 'Aucun budget défini') + '</span>' +
+      var entry = normBudget(cur().budgets[view]);
+      var scopeNote = '';
+      if (entry && entry.scope === 'until') scopeNote = ' (jusqu\'à ' + esc(monthLabel(entry.until)) + ')';
+      else if (entry && entry.scope === 'month') scopeNote = ' (ce mois seulement)';
+      bl.innerHTML = '<span>' + (budget > 0 ? 'Budget du mois : ' + esc(fmt(budget)) + scopeNote : 'Aucun budget défini') + '</span>' +
         '<button class="linkbtn" id="bEdit">' + (budget > 0 ? 'Modifier le budget' : 'Définir un budget') + '</button>';
       $('bEdit').onclick = function () { budgetEditing = true; render(); };
     }
@@ -520,6 +591,7 @@ footer { margin-top: 28px; display: flex; gap: 16px; flex-wrap: wrap; align-item
       toast('Dépense ajoutée.');
     }
     view = date.slice(0, 7);
+    cur()._budgetCache = null;
     save(); resetForm(); render();
   }
 
@@ -544,6 +616,7 @@ footer { margin-top: 28px; display: flex; gap: 16px; flex-wrap: wrap; align-item
         cur().expenses = cur().expenses.filter(function (x) { return x.id !== id; });
         pendingDelete = null; clearTimeout(pendingTimer);
         if (editingId === id) resetForm();
+        cur()._budgetCache = null;
         save(); render(); toast('Dépense supprimée.');
       } else {
         pendingDelete = id; render();
@@ -626,6 +699,7 @@ footer { margin-top: 28px; display: flex; gap: 16px; flex-wrap: wrap; align-item
       var date = dateOfTs(p.ts);
       cur().expenses.push({ id: Date.now(), amount: p.amount, cat: el.querySelector('select').value, date: date, note: el.querySelector('input').value.trim() });
       view = date.slice(0, 7);
+      cur()._budgetCache = null;
       save(); toast('Dépense ajoutée.');
     } else {
       toast('Ignoré.');
