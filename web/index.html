@@ -83,6 +83,25 @@ button { cursor: pointer; }
 }
 .iconbtn:hover { border-color: var(--accent); }
 
+/* Calendrier */
+.titlebtn { background: none; border: none; padding: 6px 8px; color: inherit; text-transform: capitalize; border-radius: 10px; }
+.titlebtn::after { content: " \25BE"; font-size: .8em; color: var(--muted); }
+.titlebtn[aria-expanded="true"]::after { content: " \25B4"; }
+.cal { background: var(--surface); border: 1px solid var(--line); border-radius: 14px; padding: 12px; margin: 0 0 20px; display: grid; gap: 10px; }
+.cal[hidden] { display: none; }
+.calhead { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.calmonth { background: none; border: none; font-weight: 700; text-transform: capitalize; padding: 8px 10px; border-radius: 10px; color: var(--accent); text-decoration: underline; text-underline-offset: 3px; }
+.calgrid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 4px 0; }
+.calw { text-align: center; font-size: .75rem; color: var(--muted); padding: 4px 0; }
+.calday { position: relative; height: 42px; border: 1px solid transparent; border-radius: 10px; background: none; font-weight: 500; color: inherit; }
+.calday.today { border-color: var(--muted); font-weight: 700; }
+.calday.has::after { content: ""; position: absolute; left: 50%; bottom: 5px; width: 5px; height: 5px; margin-left: -2.5px; border-radius: 50%; background: var(--accent); }
+.calday.in { background: var(--track); border-radius: 0; }
+.calday.end { background: var(--accent); color: var(--accent-ink); border-radius: 10px; }
+.calday.end.has::after { background: var(--accent-ink); }
+.calhint, .calsum { font-size: .85rem; color: var(--muted); }
+.calsum { color: var(--ink); font-weight: 600; }
+
 /* Hero */
 .hero { padding: 4px 0 22px; border-bottom: 1px solid var(--line); }
 .hero .label { color: var(--muted); font-size: .95rem; }
@@ -180,9 +199,11 @@ footer { margin-top: 28px; display: flex; gap: 16px; flex-wrap: wrap; align-item
 
   <div class="monthbar">
     <button class="iconbtn" id="prev" aria-label="Mois précédent">‹</button>
-    <h1 id="monthTitle"></h1>
+    <h1><button type="button" class="titlebtn" id="monthTitle" aria-expanded="false" aria-controls="calendar"></button></h1>
     <button class="iconbtn" id="next" aria-label="Mois suivant">›</button>
   </div>
+
+  <div class="cal" id="calendar" hidden></div>
 
   <div class="hero">
     <div class="label" id="heroLabel">Reste à dépenser</div>
@@ -260,6 +281,10 @@ footer { margin-top: 28px; display: flex; gap: 16px; flex-wrap: wrap; align-item
   var pendingTimer = null;
   var budgetEditing = false;
   var budgetMode = 'new';       // 'new' | 'edit'
+  var sel = null;               // null = mois affiché ; sinon { from, to } : jours (inclus) choisis au calendrier
+  var calOpen = false;
+  var calMonth = null;          // mois affiché dans le calendrier
+  var calAnchor = null;         // premier jour touché, en attente du second
   var sessMode = null;          // null | 'new' | 'rename'
   var sessDeleteArmed = false;
   var sessTimer = null;
@@ -519,18 +544,79 @@ footer { margin-top: 28px; display: flex; gap: 16px; flex-wrap: wrap; align-item
 
   function afterSessionChange() {
     budgetEditing = false; pendingDelete = null; editingId = null;
+    sel = null; calAnchor = null;
     bust();
     save(); resetForm(); render();
   }
 
   /* ---------- render ---------- */
+  function selLabel() {   // libellé de la période affichée
+    if (!sel) return monthLabel(view);
+    return sel.from === sel.to ? dshort(sel.from) : dshort(sel.from) + ' \u2192 ' + dshort(sel.to);
+  }
+  function renderCalendar() {
+    var box = $('calendar');
+    $('monthTitle').setAttribute('aria-expanded', calOpen ? 'true' : 'false');
+    box.hidden = !calOpen;
+    if (!calOpen) return;
+    var cm = calMonth || view;
+    var p = cm.split('-'), y = +p[0], m = +p[1];
+    var offset = (new Date(y, m - 1, 1).getDay() + 6) % 7;   // lundi = 0
+    var has = {};
+    cur().expenses.forEach(function (e) { if (e.date.slice(0, 7) === cm) has[e.date] = true; });
+    var today = todayStr();
+    var html = '<div class="calhead"><button type="button" class="iconbtn" data-nav="-1" aria-label="Mois précédent">\u2039</button>' +
+      '<button type="button" class="calmonth" data-month="' + cm + '">' + esc(monthLabel(cm)) + '</button>' +
+      '<button type="button" class="iconbtn" data-nav="1" aria-label="Mois suivant">\u203A</button></div><div class="calgrid">';
+    ['L', 'M', 'M', 'J', 'V', 'S', 'D'].forEach(function (w) { html += '<div class="calw">' + w + '</div>'; });
+    for (var i = 0; i < offset; i++) html += '<div></div>';
+    for (var d = 1; d <= daysIn(cm); d++) {
+      var iso = cm + '-' + pad(d), cls = 'calday';
+      if (sel && iso >= sel.from && iso <= sel.to) cls += ' in';
+      if (sel && (iso === sel.from || iso === sel.to)) cls += ' end';
+      if (iso === today) cls += ' today';
+      if (has[iso]) cls += ' has';
+      html += '<button type="button" class="' + cls + '" data-d="' + iso + '" aria-label="' + esc(dayLabel(iso)) + '">' + d + '</button>';
+    }
+    html += '</div>';
+    if (sel) {
+      var l = monthExpenses(), t = l.reduce(function (s, e) { return s + e.amount; }, 0);
+      html += '<div class="calsum">' + esc(selLabel()) + ' : ' + l.length + (l.length > 1 ? ' dépenses' : ' dépense') + ' \u00B7 ' + esc(fmt(t)) + '</div>';
+    }
+    html += '<div class="calhint">' + (calAnchor ? 'Touche un second jour pour former un intervalle.' : 'Touche un jour, ou deux jours pour un intervalle. Touche le nom du mois pour le voir en entier.') + '</div>' +
+      '<div class="actions"><button type="button" class="secondary" data-act="month">Mois entier</button><button type="button" class="primary" data-act="close" style="flex:none">Fermer</button></div>';
+    box.innerHTML = html;
+  }
+  function onCalClick(ev) {
+    var t = ev.target.closest('button');
+    if (!t) return;
+    var nav = t.getAttribute('data-nav'), d = t.getAttribute('data-d'), mo = t.getAttribute('data-month'), act = t.getAttribute('data-act');
+    if (nav) { calMonth = shiftMonth(calMonth || view, +nav); renderCalendar(); return; }
+    if (act === 'close') { calOpen = false; render(); return; }
+    if (mo || act === 'month') {
+      view = mo || calMonth || view; sel = null; calAnchor = null; calOpen = false; budgetEditing = false;
+      render(); return;
+    }
+    if (d) {
+      if (calAnchor && calAnchor !== d) {
+        sel = d < calAnchor ? { from: d, to: calAnchor } : { from: calAnchor, to: d };
+        calAnchor = null;
+      } else {
+        sel = { from: d, to: d };
+        calAnchor = (calAnchor === d) ? null : d;
+      }
+      view = sel.from.slice(0, 7); budgetEditing = false;
+      render();
+    }
+  }
   function monthExpenses() {
-    return cur().expenses.filter(function (e) { return e.date.slice(0, 7) === view; })
+    return cur().expenses.filter(function (e) { return sel ? (e.date >= sel.from && e.date <= sel.to) : e.date.slice(0, 7) === view; })
       .sort(function (a, b) { return a.date < b.date ? 1 : a.date > b.date ? -1 : b.id - a.id; });
   }
 
   function render() {
     renderSessions();
+    renderCalendar();
     var list = monthExpenses();
     var total = list.reduce(function (s, e) { return s + e.amount; }, 0);
     var isCurrent = view === ym(new Date());
@@ -540,26 +626,26 @@ footer { margin-top: 28px; display: flex; gap: 16px; flex-wrap: wrap; align-item
     var refDate = isCurrent ? todayStr() : isPast ? view + '-' + pad(nDays) : view + '-01';
     var info = cycleInfo(refDate);
 
-    $('monthTitle').textContent = monthLabel(view);
+    $('monthTitle').textContent = selLabel();
 
     // hero
     var remaining = info ? info.remaining : 0;
     var hv = $('heroValue');
-    if (info) {
+    if (info && !sel) {
       $('heroLabel').textContent = remaining >= 0 ? 'Reste à dépenser' : 'Budget dépassé de';
       hv.className = 'big' + (remaining < 0 ? ' over' : '');
       hv.innerHTML = esc(Math.abs(Math.round(remaining)).toLocaleString('fr-FR').replace(/[\u202f\u00a0]/g, '\u00a0')) + '<small>FCFA</small>';
     } else {
-      $('heroLabel').textContent = 'Total dépensé';
+      $('heroLabel').textContent = sel ? 'Total dépensé · ' + selLabel() : 'Total dépensé';
       hv.className = 'big';
       hv.innerHTML = esc(Math.round(total).toLocaleString('fr-FR').replace(/[\u202f\u00a0]/g, '\u00a0')) + '<small>FCFA</small>';
     }
-    var pct = info ? (info.budget > 0 ? Math.min(100, info.spent / info.budget * 100) : 100) : 0;
+    var pct = (info && !sel) ? (info.budget > 0 ? Math.min(100, info.spent / info.budget * 100) : 100) : 0;
     var fill = $('fill');
     fill.style.width = pct + '%';
-    fill.className = 'fill' + (info && info.spent > info.budget ? ' over' : pct >= 80 ? ' warn' : '');
+    fill.className = 'fill' + (info && !sel && info.spent > info.budget ? ' over' : pct >= 80 ? ' warn' : '');
     $('bar').setAttribute('aria-valuenow', Math.round(pct));
-    $('bar').style.visibility = info ? 'visible' : 'hidden';
+    $('bar').style.visibility = (info && !sel) ? 'visible' : 'hidden';
 
     // budget line
     var bl = $('budgetLine');
@@ -580,7 +666,8 @@ footer { margin-top: 28px; display: flex; gap: 16px; flex-wrap: wrap; align-item
     $('sSpent').textContent = fmt(total);
     var elapsed = isCurrent ? new Date().getDate() : isPast ? nDays : 1;
     $('sAvg').textContent = fmt(total / (isPast || isCurrent ? elapsed : 1));
-    if (isCurrent && info && info.end) {
+    if (sel) $('sAvg').textContent = fmt(total / (daysBetween(sel.from, sel.to) + 1));
+    if (!sel && isCurrent && info && info.end) {
       var left = Math.max(1, daysBetween(todayStr(), info.end));
       $('sPerDayK').textContent = 'Possible par jour';
       $('sPerDay').textContent = remaining > 0 ? fmt(remaining / left) : fmt(0);
@@ -607,7 +694,7 @@ footer { margin-top: 28px; display: flex; gap: 16px; flex-wrap: wrap; align-item
     // list
     var out = '';
     if (!list.length) {
-      out = '<div class="empty">Aucune dépense ce mois-ci.</div>';
+      out = '<div class="empty">' + (sel ? 'Aucune dépense sur cette période.' : 'Aucune dépense ce mois-ci.') + '</div>';
     } else {
       var byDay = {};
       list.forEach(function (e) { (byDay[e.date] = byDay[e.date] || []).push(e); });
@@ -711,7 +798,7 @@ footer { margin-top: 28px; display: flex; gap: 16px; flex-wrap: wrap; align-item
       arr.push(rec);
       toast('Dépense ajoutée.');
     }
-    view = date.slice(0, 7);
+    view = date.slice(0, 7); sel = null; calAnchor = null;
     bust();
     save(); resetForm(); render();
   }
@@ -750,7 +837,7 @@ footer { margin-top: 28px; display: flex; gap: 16px; flex-wrap: wrap; align-item
   function copyMonth() {
     var list = monthExpenses().slice().reverse();
     var total = list.reduce(function (s, e) { return s + e.amount; }, 0);
-    var lines = ['Dépenses – ' + cur().name + ' – ' + monthLabel(view)];
+    var lines = ['Dépenses – ' + cur().name + ' – ' + selLabel()];
     list.forEach(function (e) { lines.push(e.date + ' | ' + CATS[catIndex(e.cat)].name + ' | ' + e.amount + ' FCFA' + (e.note ? ' | ' + e.note : '')); });
     lines.push('Total : ' + total + ' FCFA');
     var text = lines.join('\n');
@@ -819,7 +906,7 @@ footer { margin-top: 28px; display: flex; gap: 16px; flex-wrap: wrap; align-item
     if (act === 'save') {
       var date = dateOfTs(p.ts);
       cur().expenses.push({ id: Date.now(), amount: p.amount, cat: el.querySelector('select').value, date: date, note: el.querySelector('input').value.trim() });
-      view = date.slice(0, 7);
+      view = date.slice(0, 7); sel = null; calAnchor = null;
       bust();
       save(); toast('Dépense ajoutée.');
     } else {
@@ -839,14 +926,16 @@ footer { margin-top: 28px; display: flex; gap: 16px; flex-wrap: wrap; align-item
     state.current = +this.value; sessMode = null; sessDeleteArmed = false;
     save(); afterSessionChange();
   };
-  $('prev').onclick = function () { view = shiftMonth(view, -1); budgetEditing = false; if (editingId === null) resetForm(); render(); };
-  $('next').onclick = function () { view = shiftMonth(view, 1); budgetEditing = false; if (editingId === null) resetForm(); render(); };
+  $('prev').onclick = function () { view = shiftMonth(view, -1); budgetEditing = false; sel = null; calAnchor = null; calMonth = view; if (editingId === null) resetForm(); render(); };
+  $('next').onclick = function () { view = shiftMonth(view, 1); budgetEditing = false; sel = null; calAnchor = null; calMonth = view; if (editingId === null) resetForm(); render(); };
   $('form').addEventListener('submit', submitForm);
   $('fCancel').onclick = function () { resetForm(); };
   $('list').addEventListener('click', onListClick);
   $('copyBtn').onclick = copyMonth;
   $('themeBtn').onclick = toggleTheme;
   $('pendingBox').addEventListener('click', onPendingClick);
+  $('monthTitle').onclick = function () { calOpen = !calOpen; if (calOpen) { calMonth = view; calAnchor = null; } render(); };
+  $('calendar').addEventListener('click', onCalClick);
   resetForm();
   render();
   window.refreshPending();
